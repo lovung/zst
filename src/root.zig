@@ -1,45 +1,53 @@
 const std = @import("std");
 
-/// Configuration struct for SwissTable
-pub const Config = struct {
-    /// Size of the probing group
-    group_size: usize,
-    /// Maximum load factor before resizing (between 0 and 1)
-    max_load_factor: f32,
-    /// Allocator for memory management
-    allocator: std.mem.Allocator,
-
-    /// Creates a Config instance with default values
-    pub fn default(allocator: std.mem.Allocator) Config {
-        return .{
-            .group_size = 16, // Default group size
-            .max_load_factor = 0.875, // Default max load factor (87.5%)
-            .allocator = allocator, // User-provided allocator
-        };
-    }
-};
-
 /// A Swiss Table (flat hash map) implementation with open addressing and group probing.
 /// Generic over key and value types, with configurable parameters.
 pub fn SwissTable(
     comptime K: type,
     comptime V: type,
-    comptime config: Config,
 ) type {
     return struct {
-        const Self = @This();
-
-        // Validate config
-        comptime {
-            std.debug.assert(config.group_size > 0);
-            std.debug.assert(config.max_load_factor > 0.0 and config.max_load_factor < 1.0);
+        /// Default hash function that wraps Wyhash
+        fn defaultHash() *const fn (key: K) u64 {
+            const S = struct {
+                pub fn hash(key: K) u64 {
+                    const seed = 0;
+                    return std.hash.Wyhash.hash(seed, std.mem.asBytes(&key));
+                }
+            };
+            return &S.hash;
         }
+
+        /// Configuration struct for SwissTable
+        pub const Config = struct {
+            /// Size of the probing group
+            groupSize: usize,
+            /// Maximum load factor before resizing (between 0 and 1)
+            maxLoadFactor: f32,
+            /// Allocator for memory management
+            allocator: std.mem.Allocator,
+            /// Custom hash function, defaults to defaultHash
+            hashFn: *const fn (key: K) u64,
+
+            /// Creates a Config instance with default values
+            pub fn default(allocator: std.mem.Allocator) Config {
+                return .{
+                    .groupSize = 16, // Default group size
+                    .maxLoadFactor = 0.875, // Default max load factor (87.5%)
+                    .allocator = allocator, // User-provided allocator
+                    .hashFn = defaultHash(), // Default hash function
+                };
+            }
+        };
+
+        const Self = @This();
 
         const Slot = struct {
             key: K,
             value: V,
         };
 
+        config: Config,
         ctrl: []u8,
         slots: []Slot,
         cap: usize,
@@ -49,6 +57,7 @@ pub fn SwissTable(
         pub const Error = error{
             OutOfMemory,
             CapacityOverflow,
+            InvalidConfig,
         };
 
         /// Iterator over key-value pairs
@@ -73,22 +82,27 @@ pub fn SwissTable(
         };
 
         /// Initialize a new Swiss Table with given allocator and initial capacity
-        pub fn init(initial_capacity: usize) Error!Self {
-            const cap = std.math.ceilPowerOfTwo(usize, initial_capacity) catch |err| switch (err) {
+        pub fn init(config: Config, initCap: usize) Error!Self {
+            // Validate config
+            if (config.groupSize == 0) return error.InvalidConfig;
+            if (config.maxLoadFactor <= 0.0 or config.maxLoadFactor >= 1.0) return error.InvalidConfig;
+
+            const cap = std.math.ceilPowerOfTwo(usize, initCap) catch |err| switch (err) {
                 error.Overflow => return error.CapacityOverflow,
             };
             if (cap == 0) return error.CapacityOverflow;
 
-            const ctrl = try config.allocator.alloc(u8, cap + config.group_size);
+            const ctrl = try config.allocator.alloc(u8, cap + config.groupSize);
             errdefer config.allocator.free(ctrl);
 
             const slots = try config.allocator.alloc(Slot, cap);
             errdefer config.allocator.free(slots);
 
             @memset(ctrl[0..cap], 0);
-            @memset(ctrl[cap .. cap + config.group_size], 0xFF);
+            @memset(ctrl[cap .. cap + config.groupSize], 0xFF);
 
             return Self{
+                .config = config,
                 .ctrl = ctrl,
                 .slots = slots,
                 .cap = cap,
@@ -98,8 +112,8 @@ pub fn SwissTable(
 
         /// Free all allocated memory
         pub fn deinit(self: *Self) void {
-            config.allocator.free(self.ctrl);
-            config.allocator.free(self.slots);
+            self.config.allocator.free(self.ctrl);
+            self.config.allocator.free(self.slots);
             self.* = undefined;
         }
 
@@ -134,34 +148,34 @@ pub fn SwissTable(
         }
 
         fn groupProbe(self: *const Self, pos: usize) usize {
-            return (pos + config.group_size - 1) & (self.cap - 1);
+            return (pos + self.config.groupSize - 1) & (self.cap - 1);
         }
 
         /// Insert or update a key-value pair
         pub fn put(self: *Self, key: K, value: V) Error!void {
             if (@as(f32, @floatFromInt(self.size)) >=
-                @as(f32, @floatFromInt(self.cap)) * config.max_load_factor)
+                @as(f32, @floatFromInt(self.cap)) * self.config.maxLoadFactor)
             {
                 try self.grow();
             }
 
-            const hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&key));
-            const ctrl_byte = hashToCtrl(hash);
+            const hash = self.config.hashFn(key);
+            const ctrlByte = hashToCtrl(hash);
             var pos = self.probeStart(hash);
 
             while (true) {
-                for (0..config.group_size) |i| {
+                for (0..self.config.groupSize) |i| {
                     const idx = (pos + i) & (self.cap - 1);
                     const ctrl = self.ctrl[idx];
 
                     if (ctrl == 0) {
-                        self.ctrl[idx] = ctrl_byte;
+                        self.ctrl[idx] = ctrlByte;
                         self.slots[idx] = .{ .key = key, .value = value };
                         self.size += 1;
                         return;
                     }
 
-                    if (ctrl == ctrl_byte and std.meta.eql(self.slots[idx].key, key)) {
+                    if (ctrl == ctrlByte and std.meta.eql(self.slots[idx].key, key)) {
                         self.slots[idx].value = value;
                         return;
                     }
@@ -172,17 +186,17 @@ pub fn SwissTable(
 
         /// Get value associated with key, if it exists
         pub fn get(self: *const Self, key: K) ?V {
-            const hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&key));
-            const ctrl_byte = hashToCtrl(hash);
+            const hash = self.config.hashFn(key);
+            const ctrlByte = hashToCtrl(hash);
             var pos = self.probeStart(hash);
 
             while (true) {
-                for (0..config.group_size) |i| {
+                for (0..self.config.groupSize) |i| {
                     const idx = (pos + i) & (self.cap - 1);
                     const ctrl = self.ctrl[idx];
 
                     if (ctrl == 0) return null;
-                    if (ctrl == ctrl_byte and std.meta.eql(self.slots[idx].key, key)) {
+                    if (ctrl == ctrlByte and std.meta.eql(self.slots[idx].key, key)) {
                         return self.slots[idx].value;
                     }
                 }
@@ -192,17 +206,17 @@ pub fn SwissTable(
 
         /// Remove a key-value pair, returns true if removed
         pub fn remove(self: *Self, key: K) bool {
-            const hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&key));
-            const ctrl_byte = hashToCtrl(hash);
+            const hash = self.config.hashFn(key);
+            const ctrlByte = hashToCtrl(hash);
             var pos = self.probeStart(hash);
 
             while (true) {
-                for (0..config.group_size) |i| {
+                for (0..self.config.groupSize) |i| {
                     const idx = (pos + i) & (self.cap - 1);
                     const ctrl = self.ctrl[idx];
 
                     if (ctrl == 0) return false;
-                    if (ctrl == ctrl_byte and std.meta.eql(self.slots[idx].key, key)) {
+                    if (ctrl == ctrlByte and std.meta.eql(self.slots[idx].key, key)) {
                         self.ctrl[idx] = 0x80;
                         self.size -= 1;
                         return true;
@@ -214,6 +228,7 @@ pub fn SwissTable(
 
         fn grow(self: *Self) Error!void {
             const old = Self{
+                .config = self.config,
                 .ctrl = self.ctrl,
                 .slots = self.slots,
                 .cap = self.cap,
@@ -224,14 +239,14 @@ pub fn SwissTable(
             if (self.cap == 0) return error.CapacityOverflow;
 
             self.size = 0;
-            self.ctrl = try config.allocator.alloc(u8, self.cap + config.group_size);
-            errdefer config.allocator.free(self.ctrl);
+            self.ctrl = try self.config.allocator.alloc(u8, self.cap + self.config.groupSize);
+            errdefer self.config.allocator.free(self.ctrl);
 
-            self.slots = try config.allocator.alloc(Slot, self.cap);
-            errdefer config.allocator.free(self.slots);
+            self.slots = try self.config.allocator.alloc(Slot, self.cap);
+            errdefer self.config.allocator.free(self.slots);
 
             @memset(self.ctrl[0..self.cap], 0);
-            @memset(self.ctrl[self.cap .. self.cap + config.group_size], 0xFF);
+            @memset(self.ctrl[self.cap .. self.cap + self.config.groupSize], 0xFF);
 
             var it = old.iterator();
             while (it.next()) |entry| {
@@ -246,10 +261,11 @@ pub fn SwissTable(
 // Unit tests
 test "SwissTable functionality" {
     const allocator = std.testing.allocator;
-    const Map = SwissTable(u32, []const u8, Config.default(allocator));
+    const Map = SwissTable(u32, []const u8);
+    const config = Map.Config.default(allocator);
 
     // Test initialization
-    var map = try Map.init(16);
+    var map = try Map.init(config, 16);
     defer map.deinit();
     try std.testing.expectEqual(@as(usize, 16), map.capacity());
     try std.testing.expectEqual(@as(usize, 0), map.count());
@@ -298,4 +314,48 @@ test "SwissTable functionality" {
     try std.testing.expectEqual(@as(usize, 0), map.count());
     try std.testing.expect(map.get(2) == null);
     try std.testing.expect(map.get(3) == null);
+}
+
+test "SwissTable with custom hash function" {
+    const allocator = std.testing.allocator;
+    const Map = SwissTable(u32, []const u8);
+
+    // Simple custom hash function that uses XOR and shifts
+    const CustomHasher = struct {
+        pub fn hash(key: u32) u64 {
+            var x = @as(u64, key);
+            x ^= x >> 33;
+            x *%= 0xff51afd7ed558ccd;
+            x ^= x >> 33;
+            x *%= 0xc4ceb9fe1a85ec53;
+            x ^= x >> 33;
+            return x;
+        }
+    };
+
+    var config = Map.Config.default(allocator);
+    config.hashFn = &CustomHasher.hash;
+
+    // Test initialization
+    var map = try Map.init(config, 16);
+    defer map.deinit();
+
+    // Basic functionality test with custom hash
+    try map.put(1, "one");
+    try map.put(2, "two");
+    try map.put(3, "three");
+
+    try std.testing.expectEqualStrings("one", map.get(1).?);
+    try std.testing.expectEqualStrings("two", map.get(2).?);
+    try std.testing.expectEqualStrings("three", map.get(3).?);
+    try std.testing.expect(map.get(4) == null);
+
+    // Test collisions still work
+    try map.put(1, "updated");
+    try std.testing.expectEqualStrings("updated", map.get(1).?);
+
+    // Test remove with custom hash
+    try std.testing.expect(map.remove(2));
+    try std.testing.expect(!map.remove(2)); // Already removed
+    try std.testing.expect(map.get(2) == null);
 }
