@@ -57,6 +57,8 @@ pub fn SwissTable(
         pub const Error = error{
             OutOfMemory,
             CapacityOverflow,
+            CapacityInsufficient,
+            KeyExists,
             InvalidConfig,
         };
 
@@ -255,6 +257,197 @@ pub fn SwissTable(
 
             @constCast(&old).deinit();
         }
+
+        /// Returns a pointer to the value stored at the specified key
+        pub fn getPtr(self: *Self, key: K) ?*V {
+            const hash = self.config.hashFn(key);
+            const ctrlByte = hashToCtrl(hash);
+            var pos = self.probeStart(hash);
+
+            while (true) {
+                for (0..self.config.groupSize) |i| {
+                    const idx = (pos + i) & (self.cap - 1);
+                    const ctrl = self.ctrl[idx];
+
+                    if (ctrl == 0) return null;
+                    if (ctrl == ctrlByte and std.meta.eql(self.slots[idx].key, key)) {
+                        return &self.slots[idx].value;
+                    }
+                }
+                pos = self.groupProbe(pos);
+            }
+        }
+
+        /// Returns a const pointer to the value stored at the specified key
+        pub fn getEntry(self: *const Self, key: K) ?struct { key: K, value: V } {
+            const hash = self.config.hashFn(key);
+            const ctrlByte = hashToCtrl(hash);
+            var pos = self.probeStart(hash);
+
+            while (true) {
+                for (0..self.config.groupSize) |i| {
+                    const idx = (pos + i) & (self.cap - 1);
+                    const ctrl = self.ctrl[idx];
+
+                    if (ctrl == 0) return null;
+                    if (ctrl == ctrlByte and std.meta.eql(self.slots[idx].key, key)) {
+                        return .{
+                            .key = self.slots[idx].key,
+                            .value = self.slots[idx].value,
+                        };
+                    }
+                }
+                pos = self.groupProbe(pos);
+            }
+        }
+
+        /// Put a new key-value pair into the hash map, returning a pointer to the value
+        pub fn getOrPut(self: *Self, key: K) Error!struct { found_existing: bool, ptr: *V } {
+            const hash = self.config.hashFn(key);
+            const ctrlByte = hashToCtrl(hash);
+            var pos = self.probeStart(hash);
+            var first_empty: ?usize = null;
+
+            while (true) {
+                for (0..self.config.groupSize) |i| {
+                    const idx = (pos + i) & (self.cap - 1);
+                    const ctrl = self.ctrl[idx];
+
+                    if (ctrl == 0) {
+                        if (first_empty == null) first_empty = idx;
+                        // Check if we need to grow before inserting
+                        if (@as(f32, @floatFromInt(self.size + 1)) >
+                            @as(f32, @floatFromInt(self.cap)) * self.config.maxLoadFactor)
+                        {
+                            try self.grow();
+                            return self.getOrPut(key);
+                        }
+                        self.ctrl[idx] = ctrlByte;
+                        self.slots[idx].key = key;
+                        self.size += 1;
+                        return .{
+                            .found_existing = false,
+                            .ptr = &self.slots[idx].value,
+                        };
+                    }
+
+                    if (ctrl == ctrlByte and std.meta.eql(self.slots[idx].key, key)) {
+                        return .{
+                            .found_existing = true,
+                            .ptr = &self.slots[idx].value,
+                        };
+                    }
+                }
+                pos = self.groupProbe(pos);
+            }
+        }
+
+        /// Put a new key-value pair into the hash map, asserting that the key does not already exist
+        pub fn putNoClobber(self: *Self, key: K, value: V) Error!void {
+            const result = try self.getOrPut(key);
+            if (result.found_existing) {
+                return error.KeyExists;
+            }
+            result.ptr.* = value;
+        }
+
+        /// Returns a pointer to the value if it exists, otherwise puts the value in the map
+        pub fn getOrPutValue(self: *Self, key: K, value: V) Error!*V {
+            const result = try self.getOrPut(key);
+            if (!result.found_existing) {
+                result.ptr.* = value;
+            }
+            return result.ptr;
+        }
+
+        /// Returns true if the map contains a value for the specified key
+        pub fn contains(self: *const Self, key: K) bool {
+            return self.get(key) != null;
+        }
+
+        /// Ensures the map has enough capacity to hold `additional_count` more items
+        pub fn ensureTotalCapacity(self: *Self, additional_count: usize) Error!void {
+            const new_size = self.size + additional_count;
+            const min_cap = @as(f32, @floatFromInt(new_size)) / self.config.maxLoadFactor;
+            var new_cap = self.cap;
+            while (@as(f32, @floatFromInt(new_cap)) < min_cap) {
+                new_cap *= 2;
+                if (new_cap == 0) return error.CapacityOverflow;
+            }
+            if (new_cap > self.cap) {
+                const old = Self{
+                    .config = self.config,
+                    .ctrl = self.ctrl,
+                    .slots = self.slots,
+                    .cap = self.cap,
+                    .size = self.size,
+                };
+
+                self.cap = new_cap;
+                self.size = 0;
+                self.ctrl = try self.config.allocator.alloc(u8, self.cap + self.config.groupSize);
+                errdefer self.config.allocator.free(self.ctrl);
+
+                self.slots = try self.config.allocator.alloc(Slot, self.cap);
+                errdefer self.config.allocator.free(self.slots);
+
+                @memset(self.ctrl[0..self.cap], 0);
+                @memset(self.ctrl[self.cap .. self.cap + self.config.groupSize], 0xFF);
+
+                var it = old.iterator();
+                while (it.next()) |entry| {
+                    try self.put(entry[0], entry[1]);
+                }
+
+                @constCast(&old).deinit();
+            }
+        }
+
+        /// Ensures the map has enough capacity to hold `additional_count` more items,
+        /// but may fail instead of automatically growing the capacity
+        pub fn ensureUnusedCapacity(self: *Self, additional_count: usize) Error!void {
+            const new_size = self.size + additional_count;
+            const min_cap = @as(f32, @floatFromInt(new_size)) / self.config.maxLoadFactor;
+            if (@as(f32, @floatFromInt(self.cap)) < min_cap) {
+                return error.CapacityInsufficient;
+            }
+        }
+
+        /// Put a new key-value pair into the hash map and return the previous value if it existed
+        pub fn fetchPut(self: *Self, key: K, value: V) Error!?V {
+            const hash = self.config.hashFn(key);
+            const ctrlByte = hashToCtrl(hash);
+            var pos = self.probeStart(hash);
+
+            // Check if we need to grow before inserting
+            if (@as(f32, @floatFromInt(self.size)) >=
+                @as(f32, @floatFromInt(self.cap)) * self.config.maxLoadFactor)
+            {
+                try self.grow();
+                return self.fetchPut(key, value);
+            }
+
+            while (true) {
+                for (0..self.config.groupSize) |i| {
+                    const idx = (pos + i) & (self.cap - 1);
+                    const ctrl = self.ctrl[idx];
+
+                    if (ctrl == 0) {
+                        self.ctrl[idx] = ctrlByte;
+                        self.slots[idx] = .{ .key = key, .value = value };
+                        self.size += 1;
+                        return null;
+                    }
+
+                    if (ctrl == ctrlByte and std.meta.eql(self.slots[idx].key, key)) {
+                        const old_value = self.slots[idx].value;
+                        self.slots[idx].value = value;
+                        return old_value;
+                    }
+                }
+                pos = self.groupProbe(pos);
+            }
+        }
     };
 }
 
@@ -358,4 +551,91 @@ test "SwissTable with custom hash function" {
     try std.testing.expect(map.remove(2));
     try std.testing.expect(!map.remove(2)); // Already removed
     try std.testing.expect(map.get(2) == null);
+}
+
+// Add new test for AutoHashMap compatibility
+test "SwissTable AutoHashMap compatibility" {
+    const allocator = std.testing.allocator;
+    const Map = SwissTable(u32, []const u8);
+    const config = Map.Config.default(allocator);
+
+    var map = try Map.init(config, 16);
+    defer map.deinit();
+
+    // Test getOrPut
+    {
+        const result = try map.getOrPut(1);
+        try std.testing.expect(!result.found_existing);
+        result.ptr.* = "one";
+        const result2 = try map.getOrPut(1);
+        try std.testing.expect(result2.found_existing);
+        try std.testing.expectEqualStrings("one", result2.ptr.*);
+    }
+
+    // Test putNoClobber
+    try map.putNoClobber(2, "two");
+    try std.testing.expectError(error.KeyExists, map.putNoClobber(2, "another"));
+
+    // Test getOrPutValue
+    const val_ptr = try map.getOrPutValue(3, "three");
+    try std.testing.expectEqualStrings("three", val_ptr.*);
+    const existing_ptr = try map.getOrPutValue(3, "another");
+    try std.testing.expectEqualStrings("three", existing_ptr.*);
+
+    // Test getPtr
+    try std.testing.expectEqualStrings("one", map.getPtr(1).?.*);
+    try std.testing.expect(map.getPtr(99) == null);
+
+    // Test getEntry
+    const entry = map.getEntry(2).?;
+    try std.testing.expectEqual(@as(u32, 2), entry.key);
+    try std.testing.expectEqualStrings("two", entry.value);
+
+    // Test contains
+    try std.testing.expect(map.contains(1));
+    try std.testing.expect(!map.contains(99));
+
+    // Test capacity management
+    try map.ensureTotalCapacity(100);
+    try std.testing.expect(map.capacity() >= 100);
+    try std.testing.expectError(error.CapacityInsufficient, map.ensureUnusedCapacity(1000));
+
+    // Test fetchPut
+    {
+        const old_value = try map.fetchPut(1, "one_new");
+        try std.testing.expectEqualStrings("one", old_value.?);
+        try std.testing.expectEqualStrings("one_new", map.get(1).?);
+
+        const no_old = try map.fetchPut(4, "four");
+        try std.testing.expect(no_old == null);
+        try std.testing.expectEqualStrings("four", map.get(4).?);
+    }
+}
+
+test "hashing" {
+    const Point = struct { x: i32, y: i32 };
+    const allocator = std.testing.allocator;
+
+    var map = std.AutoHashMap(u32, Point).init(
+        allocator,
+    );
+    defer map.deinit();
+
+    try map.put(1525, .{ .x = 1, .y = -4 });
+    try map.put(1550, .{ .x = 2, .y = -3 });
+    try map.put(1575, .{ .x = 3, .y = -2 });
+    try map.put(1600, .{ .x = 4, .y = -1 });
+
+    try std.testing.expect(map.count() == 4);
+
+    var sum = Point{ .x = 0, .y = 0 };
+    var iterator = map.iterator();
+
+    while (iterator.next()) |entry| {
+        sum.x += entry.value_ptr.x;
+        sum.y += entry.value_ptr.y;
+    }
+
+    try std.testing.expect(sum.x == 10);
+    try std.testing.expect(sum.y == -10);
 }
